@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ZTGW Terraform Deployment Workflow</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    margin: 0;
+    padding: 40px 20px;
+  }
+  h1 {
+    text-align: center;
+    color: #f8fafc;
+    margin-bottom: 8px;
+  }
+  p.subtitle {
+    text-align: center;
+    color: #94a3b8;
+    margin-top: 0;
+    margin-bottom: 32px;
+  }
+  .diagram-container {
+    max-width: 1100px;
+    margin: 0 auto 40px auto;
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 24px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+  }
+  .legend {
+    max-width: 1100px;
+    margin: 0 auto;
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 24px 32px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+  }
+  .legend h2 {
+    margin-top: 0;
+    color: #f8fafc;
+    font-size: 18px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid #334155;
+  }
+  th {
+    color: #94a3b8;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  td {
+    color: #e2e8f0;
+    font-size: 14px;
+  }
+  .swatch {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .note {
+    max-width: 1100px;
+    margin: 24px auto 0 auto;
+    color: #94a3b8;
+    font-size: 14px;
+    line-height: 1.6;
+    text-align: center;
+  }
+  code {
+    background: #334155;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #f8fafc;
+  }
+</style>
+</head>
+<body>
+
+<h1>ZTGW Terraform Deployment Workflow</h1>
+<p class="subtitle">What happens when you run <code>terraform apply -var-file=ztgw-full-deploy.tfvars</code></p>
+
+<div class="diagram-container">
+<pre class="mermaid">
+flowchart TD
+    Start(["👤 You run:<br/>terraform apply -var-file=ztgw-full-deploy.tfvars"]):::userAction
+
+    Start --> Input
+
+    subgraph Input [" 📝 STAGE 1 — Configuration "]
+        direction TB
+        I1["ztgw-full-deploy.tfvars<br/>gateway name, region, VPC/subnet IDs,<br/>Zscaler creds, AWS account to whitelist"]:::config
+    end
+
+    Input --> Glue1
+
+    subgraph Glue1 [" ⚙️ STAGE 2 — Terraform writes the order form "]
+        direction TB
+        G1["local_file.ztgw_input<br/>builds JSON payload from your .tfvars<br/>writes → .ztgw-input.json"]:::terraform
+    end
+
+    Glue1 --> Glue2
+
+    subgraph Glue2 [" 🤖 STAGE 3 — Terraform launches the script "]
+        direction TB
+        G2["null_resource.ztgw<br/>(local-exec provisioner)<br/>runs scripts/deploy_ztgw.sh<br/>⚠️ only during apply, never during plan"]:::terraform
+    end
+
+    Glue2 --> Zscaler
+
+    subgraph Zscaler [" ☁️ STAGE 4 — Zscaler REST API (inside deploy_ztgw.sh) "]
+        direction TB
+        Z1["🔑 Authenticate via OAuth2<br/>(client_id + client_secret)"]:::zscaler
+        Z2["🔍 Check if gateway already exists<br/>by name"]:::zscaler
+        Z3["✨ Create new ZT Gateway<br/>(region, AZs, whitelisted account)"]:::zscaler
+        Z4["⏳ Poll every 15s<br/>until health = HEALTHY<br/>(can take several minutes)"]:::zscaler
+        Z5["⚡ Force activation"]:::zscaler
+        Z1 --> Z2 --> Z3 --> Z4 --> Z5
+    end
+
+    Zscaler --> Glue3
+
+    subgraph Glue3 [" 📨 STAGE 5 — Script writes the receipt "]
+        direction TB
+        G3["writes result to<br/>.ztgw-output.json<br/>(gateway_id, endpoint_service_name, health)"]:::terraform
+    end
+
+    Glue3 --> Read
+
+    subgraph Read [" 📖 STAGE 6 — Terraform reads the receipt "]
+        direction TB
+        R1["data.local_file.ztgw_output<br/>reads .ztgw-output.json"]:::terraform
+        R2["local.endpoint_service_name<br/>extracted for use below"]:::terraform
+        R1 --> R2
+    end
+
+    Read --> AWS
+
+    subgraph AWS [" 🟧 STAGE 7 — AWS resources created "]
+        direction TB
+        A1["aws_vpc_endpoint<br/>GatewayLoadBalancer type<br/>in your existing VPC, both subnets"]:::aws
+        A2["data.aws_route_table<br/>auto-discovers route table<br/>for each subnet"]:::aws
+        A3["aws_route<br/>0.0.0.0/0 → GWLB Endpoint<br/>(one per subnet's route table)"]:::aws
+        A1 --> A2 --> A3
+    end
+
+    AWS --> Done(["✅ Done<br/>Gateway + VPC Endpoint + Routes all live"]):::doneNode
+
+    classDef userAction fill:#2d2d2d,color:#fff,stroke:#888,stroke-width:2px
+    classDef config fill:#2563eb,color:#fff,stroke:#1e3a8a,stroke-width:2px
+    classDef terraform fill:#7c3aed,color:#fff,stroke:#4c1d95,stroke-width:2px
+    classDef zscaler fill:#ea580c,color:#fff,stroke:#9a3412,stroke-width:2px
+    classDef aws fill:#059669,color:#fff,stroke:#065f46,stroke-width:2px
+    classDef doneNode fill:#16a34a,color:#fff,stroke:#14532d,stroke-width:3px
+
+    style Input fill:#1e3a8a,color:#fff,stroke:#2563eb,stroke-width:2px
+    style Glue1 fill:#4c1d95,color:#fff,stroke:#7c3aed,stroke-width:2px
+    style Glue2 fill:#4c1d95,color:#fff,stroke:#7c3aed,stroke-width:2px
+    style Zscaler fill:#9a3412,color:#fff,stroke:#ea580c,stroke-width:2px
+    style Glue3 fill:#4c1d95,color:#fff,stroke:#7c3aed,stroke-width:2px
+    style Read fill:#4c1d95,color:#fff,stroke:#7c3aed,stroke-width:2px
+    style AWS fill:#065f46,color:#fff,stroke:#059669,stroke-width:2px
+</pre>
+</div>
+
+<div class="legend">
+  <h2>Color Legend</h2>
+  <table>
+    <tr><th>Color</th><th>Meaning</th></tr>
+    <tr><td><span class="swatch" style="background:#2563eb;"></span>Blue</td><td>Your input &mdash; the <code>.tfvars</code> file you edit</td></tr>
+    <tr><td><span class="swatch" style="background:#7c3aed;"></span>Purple</td><td>Terraform's own automation glue (writing/reading files, launching the script)</td></tr>
+    <tr><td><span class="swatch" style="background:#ea580c;"></span>Orange</td><td>Zscaler cloud &mdash; the actual API calls happening remotely</td></tr>
+    <tr><td><span class="swatch" style="background:#059669;"></span>Green</td><td>AWS resources being created &mdash; the real infrastructure</td></tr>
+    <tr><td><span class="swatch" style="background:#16a34a;"></span>Bright Green</td><td>Final result</td></tr>
+  </table>
+</div>
+
+<p class="note">
+  Everything from Stage 2 through Stage 7 happens automatically inside one <code>terraform apply</code> run &mdash;
+  you only interact with Stage 1 (editing the <code>.tfvars</code> file) and watch Stage 4 happen
+  (the health-check polling can take a few minutes and prints progress to your terminal).
+</p>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

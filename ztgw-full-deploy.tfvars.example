@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------
+# Full deployment: ZT Gateway + GWLB Endpoint(s), in ONE terraform apply.
+#
+# Usage:
+#   cp ztgw-full-deploy.tfvars.example ztgw-full-deploy.tfvars
+#   # edit the real values below -- NEVER commit the resulting .tfvars file
+#   terraform init
+#   terraform apply -var-file=ztgw-full-deploy.tfvars
+#
+# This is fully automated -- no manual script invocation, no zsec wrapper
+# required. Terraform will:
+#   1. Write the gateway API payload to .ztgw-input.json
+#   2. Run scripts/deploy_ztgw.sh automatically (local-exec), which
+#      creates the ZT Gateway in Zscaler and polls until healthy
+#      (can take a few minutes -- progress prints to your terminal)
+#   3. Read the result back from .ztgw-output.json
+#   4. Create one AWS VPC Gateway Load Balancer Endpoint + route per
+#      subnet/AZ you list below
+#
+# NOTE: client_secret ends up in Terraform state (.tfstate) in plaintext
+# via local_file.ztgw_input. Known/accepted tradeoff for the convenience
+# of a single `terraform apply`. Do not commit your .tfstate file.
+# ---------------------------------------------------------------------------
+
+deploy_ztgw     = true
+deploy_endpoint = true
+
+# --- Zscaler OneAPI authentication ---
+client_id     = "your-zscaler-oneapi-client-id"
+client_secret = "your-zscaler-oneapi-client-secret"
+vanity_domain = "your-vanity-domain"          # e.g. "acme" -> acme.zslogin.net
+cloud         = "zscalerthree"                # zscaler | zscalerone | zscalertwo | zscalerthree | zscalerbeta
+login_domain  = "zslogin.net"                 # override only if your tenant needs it
+
+# --- ZT Gateway ---
+gateway_name          = "my-ztgw"
+location_name         = "my-ztgw-location"    # must be unique in your tenant -- see README Troubleshooting
+aws_region            = "us-west-2"
+aws_region_code       = "US_WEST_2"           # uppercase/underscored version of aws_region
+aws_endpoint_region   = "us-west-2"
+availability_zone_ids = []                    # leave empty to auto-discover via AWS CLI, or specify e.g. ["usw2-az1", "usw2-az2"]
+
+# AWS-side whitelist: allows these raw AWS account IDs to create a GWLB
+# Endpoint connection to this gateway's endpoint service.
+additional_aws_accounts = ["123456789012"]
+
+# Zscaler-side allowed_accounts / account_groups (optional -- can be
+# configured later via the Admin Portal or left empty)
+allowed_accounts = []
+account_groups   = []
+
+# --- Consumer VPC Endpoint (existing VPC) ---
+consumer_vpc_id     = "vpc-xxxxxxxxxxxxxxxxx"
+consumer_subnet_ids = ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"]  # one per AZ
+consumer_route_cidr = "0.0.0.0/0"
+consumer_deploy_key = "my-ztgw"

@@ -1,0 +1,641 @@
+#!/usr/bin/env bash
+
+set -eo pipefail
+
+RED=$(tput setaf 1)
+GREEN=$(tput setaf 2)
+YELLOW=$(tput setaf 3)
+CYAN=$(tput setaf 6)
+RESET=$(tput sgr0)
+
+usage() {
+    echo ""
+    echo "Usage: $0 <up|destroy>"
+    echo ""
+    echo "  up       Deploy AWS ZTGW (interactive guided)"
+    echo "  destroy  Delete AWS ZTGW and clean up"
+    echo ""
+    exit 1
+}
+
+banner() {
+    echo ""
+    echo "${GREEN}============================================================"
+    echo "  Zscaler AWS ZTGW — Interactive Deployment Wrapper"
+    echo "============================================================${RESET}"
+    echo ""
+}
+
+if [ $# -ne 1 ]; then
+    usage
+else
+    case $1 in
+        up|destroy) oper=$1 ;;
+        *) usage ;;
+    esac
+fi
+
+cd "$(dirname "$0")"
+# shellcheck source=./scripts/zscaler_api.sh
+source "scripts/zscaler_api.sh"
+banner
+
+echo "Detecting OS and architecture..."
+archdetect=$(uname -m)
+tversion=1.9.0
+
+if [[ "$OSTYPE" == "linux"* ]]; then
+    os_str=linux; arch=amd64; ostype=Linux
+elif [[ "$OSTYPE" == "darwin"* && "$archdetect" == "arm64" ]]; then
+    os_str=darwin; arch=arm64; ostype=MacOS_arm64
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    os_str=darwin; arch=amd64; ostype=MacOS
+else
+    echo "${RED}Unsupported OS: $OSTYPE${RESET}"; exit 1
+fi
+echo "${GREEN}OS: $ostype | Terraform version: $tversion${RESET}"
+echo ""
+
+dir=bin
+[[ ! -e $dir ]] && mkdir -p $dir
+
+if [[ ! -e ./$dir/terraform ]]; then
+    echo "Downloading Terraform $tversion for ${os_str}_${arch}..."
+    curl -so ./$dir/terraform_${tversion}_${arch}.zip \
+        "https://releases.hashicorp.com/terraform/${tversion}/terraform_${tversion}_${os_str}_${arch}.zip"
+    unzip -qo ./$dir/terraform_${tversion}_${arch}.zip -d ./$dir
+    rm -f ./$dir/terraform_${tversion}_${arch}.zip
+    echo "${GREEN}Terraform $tversion downloaded to ./$dir/${RESET}"
+else
+    echo "${GREEN}Terraform binary already present in ./$dir/${RESET}"
+fi
+echo ""
+
+export PATH="${PWD}/bin:${PATH}"
+
+# -----------------------------------------------------------------------
+# Interactive prompts (first run only)
+# -----------------------------------------------------------------------
+if [[ "$oper" == "up" && ! -e ./.zsecrc ]]; then
+
+    # -----------------------------------------------------------------------
+    # Step 1: Deployment mode
+    # -----------------------------------------------------------------------
+    PS3="${CYAN}Select deployment mode: ${RESET}"
+    modes=(
+        "Full deployment — Deploy ZTGW + VPC Endpoint (Recommended)"
+        "ZTGW-only — Deploy ZTGW and output endpoint service name"
+        "Endpoint-only — Create VPC Endpoint from an existing ZTGW endpoint service"
+    )
+    select mode_choice in "${modes[@]}"; do
+        case $REPLY in
+            1)
+                echo "${GREEN}Full deployment selected${RESET}"
+                deploy_ztgw=true
+                deploy_endpoint=true
+                echo "export TF_VAR_deploy_ztgw=true" >> .zsecrc
+                echo "export TF_VAR_deploy_endpoint=true" >> .zsecrc
+                break
+                ;;
+            2)
+                echo "${GREEN}ZTGW-only deployment selected${RESET}"
+                deploy_ztgw=true
+                deploy_endpoint=false
+                echo "export TF_VAR_deploy_ztgw=true" >> .zsecrc
+                echo "export TF_VAR_deploy_endpoint=false" >> .zsecrc
+                break
+                ;;
+            3)
+                echo "${GREEN}Endpoint-only deployment selected${RESET}"
+                deploy_ztgw=false
+                deploy_endpoint=true
+                echo "export TF_VAR_deploy_ztgw=false" >> .zsecrc
+                echo "export TF_VAR_deploy_endpoint=true" >> .zsecrc
+                break
+                ;;
+            *)
+                echo "${RED}Invalid selection. Enter 1, 2, or 3${RESET}"
+                ;;
+        esac
+    done
+    echo ""
+
+    # -----------------------------------------------------------------------
+    # Step 2: Zscaler OneAPI credentials (all modes)
+    # -----------------------------------------------------------------------
+    echo "${YELLOW}--- Zscaler OneAPI Authentication ---${RESET}"
+    echo ""
+
+    while [ -z "$client_id" ]; do
+        read -r -p "${CYAN}Enter Zscaler OneAPI Client ID: ${RESET}" client_id
+    done
+    echo "export TF_VAR_client_id='$client_id'" >> .zsecrc
+
+    while [ -z "$client_secret" ]; do
+        read -rs -p "${CYAN}Enter Zscaler OneAPI Client Secret (input hidden): ${RESET}" client_secret
+        echo ""
+    done
+    echo "export TF_VAR_client_secret='$client_secret'" >> .zsecrc
+
+    while [ -z "$vanity_domain" ]; do
+        read -r -p "${CYAN}Enter Zscaler Vanity Domain (e.g. acme): ${RESET}" vanity_domain
+    done
+    echo "export TF_VAR_vanity_domain='$vanity_domain'" >> .zsecrc
+
+    PS3="${CYAN}Select Zscaler cloud: ${RESET}"
+    clouds=("zscaler" "zscalerone" "zscalertwo" "zscalerthree" "zscalerbeta")
+    select cloud_choice in "${clouds[@]}"; do
+        for c in "${clouds[@]}"; do
+            if [[ "$c" == "$cloud_choice" ]]; then
+                cloud=$cloud_choice
+                echo "${GREEN}Cloud: $cloud${RESET}"
+                echo "export TF_VAR_cloud='$cloud'" >> .zsecrc
+                break 2
+            fi
+        done
+        echo "${RED}Invalid selection${RESET}"
+    done
+
+    # Optional login domain override
+    echo ""
+    echo "${YELLOW}Note: Some tenants (e.g. zscalerthree) authenticate through the production${RESET}"
+    echo "${YELLOW}login domain (zslogin.net) instead of their cloud-specific domain.${RESET}"
+    echo "${YELLOW}If authentication fails with a DNS error, try 'zslogin.net' as the override.${RESET}"
+    read -r -p "${CYAN}Enter custom login domain (e.g. zslogin.net) [Enter to use '${cloud}' default]: ${RESET}" login_domain_input
+    if [ -n "$login_domain_input" ]; then
+        echo "export TF_VAR_login_domain='$login_domain_input'" >> .zsecrc
+        echo "${GREEN}Using custom login domain: $login_domain_input (instead of cloud default)${RESET}"
+    fi
+    echo ""
+
+    # -----------------------------------------------------------------------
+    # Step 3: ZTGW parameters (full + ZTGW-only modes)
+    # -----------------------------------------------------------------------
+    if [[ "$deploy_ztgw" == "true" ]]; then
+        echo "${YELLOW}--- AWS ZTGW Configuration ---${RESET}"
+        echo ""
+
+        gateway_name_default="aws-ztgw"
+        read -r -p "${CYAN}Enter ZTGW name [Default=$gateway_name_default]: ${RESET}" gateway_name_input
+        gateway_name=${gateway_name_input:-$gateway_name_default}
+        echo "export TF_VAR_gateway_name='$gateway_name'" >> .zsecrc
+
+        aws_region_default="us-west-2"
+        read -r -p "${CYAN}Enter AWS region [Default=$aws_region_default]: ${RESET}" aws_region_input
+        aws_region=${aws_region_input:-$aws_region_default}
+        echo "export TF_VAR_aws_region='$aws_region'" >> .zsecrc
+        echo "export TF_VAR_aws_endpoint_region='$aws_region'" >> .zsecrc
+
+        aws_region_code=$(echo "$aws_region" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+        echo "export TF_VAR_aws_region_code='$aws_region_code'" >> .zsecrc
+
+        # Try to auto-discover AZ IDs
+        az_ids_default='[]'
+        discovered_azs=$(aws ec2 describe-availability-zones --region "$aws_region" \
+            --query "AvailabilityZones[*].ZoneId" --output json 2>/dev/null || echo "")
+        if [ -n "$discovered_azs" ] && [ "$discovered_azs" != "[]" ]; then
+            az_ids_default="$discovered_azs"
+            echo "${GREEN}Discovered AZ IDs: $az_ids_default${RESET}"
+        else
+            echo "${YELLOW}AWS CLI not available. Will use deploy_zgtw.sh auto-discovery.${RESET}"
+        fi
+        if [ -n "$discovered_azs" ] && [ "$discovered_azs" != "[]" ]; then
+            read -r -p "${CYAN}Enter AZ IDs to use (comma-separated) [Enter for all discovered]: ${RESET}" az_selection
+            if [ -n "$az_selection" ]; then
+                az_ids_default=$(python3 -c "import json; ids=[x.strip() for x in '$az_selection'.split(',') if x.strip()]; print(json.dumps(ids))" 2>/dev/null)
+            fi
+        fi
+        echo "export TF_VAR_availability_zone_ids='$az_ids_default'" >> .zsecrc
+
+        location_name_default="${gateway_name}-location"
+        read -r -p "${CYAN}Enter Zscaler location name [Default=$location_name_default]: ${RESET}" location_name_input
+        location_name=${location_name_input:-$location_name_default}
+        echo "export TF_VAR_location_name='$location_name'" >> .zsecrc
+
+        echo "${YELLOW}--- Workload Discovery Service (WDS) Account/Group Selection ---${RESET}"
+        echo "${YELLOW}Querying Zscaler for already-onboarded WDS accounts and groups...${RESET}"
+        echo ""
+
+        zs_login_domain "$cloud" "$login_domain_input"
+        wds_query_ok=false
+        if zs_authenticate "$client_id" "$client_secret" "$vanity_domain" "$cloud" "$LOGIN_DOMAIN" 2>/dev/null; then
+            wds_query_ok=true
+        else
+            echo "${YELLOW}Could not authenticate to query WDS data -- falling back to manual entry below.${RESET}"
+        fi
+
+        if [[ "$wds_query_ok" == "true" ]]; then
+            WDS_TMPDIR=$(mktemp -d)
+
+            zs_get "/publicCloudInfo" > "$WDS_TMPDIR/accounts.json"
+            python3 -c "
+import json
+with open('$WDS_TMPDIR/accounts.json') as f:
+    try:
+        data = json.load(f)
+    except Exception:
+        data = []
+with open('$WDS_TMPDIR/account_lines.txt', 'w') as out:
+    for a in data:
+        if a.get('cloudType') == 'AWS':
+            zid = a.get('id', '')
+            name = a.get('name', '?')
+            aws_id = a.get('accountDetails', {}).get('awsAccountId', '?')
+            out.write(f'{zid}|{name}|{aws_id}\n')
+"
+            ACCOUNT_LINES=()
+            while IFS= read -r line; do
+                ACCOUNT_LINES+=("$line")
+            done < "$WDS_TMPDIR/account_lines.txt"
+
+            if [ ${#ACCOUNT_LINES[@]} -gt 0 ]; then
+                echo "${GREEN}Onboarded WDS accounts found:${RESET}"
+                i=1
+                for line in "${ACCOUNT_LINES[@]}"; do
+                    IFS='|' read -r zid name awsid <<< "$line"
+                    echo "  $i) $name ($awsid) - Zscaler ID $zid"
+                    i=$((i+1))
+                done
+                read -r -p "${CYAN}Select accounts to link as allowed_accounts (comma-separated numbers, Enter to skip): ${RESET}" acct_selection
+                if [ -n "$acct_selection" ]; then
+                    allowed_accounts=$(python3 -c "
+import json
+with open('$WDS_TMPDIR/account_lines.txt') as f:
+    lines = [l.strip() for l in f if l.strip()]
+sel = [int(x.strip()) for x in '$acct_selection'.split(',') if x.strip()]
+ids = []
+for s in sel:
+    if 1 <= s <= len(lines):
+        ids.append(int(lines[s-1].split('|')[0]))
+print(json.dumps(ids))
+")
+                    echo "export TF_VAR_allowed_accounts='$allowed_accounts'" >> .zsecrc
+                    echo "${GREEN}Selected allowed_accounts: $allowed_accounts${RESET}"
+                fi
+            else
+                echo "${YELLOW}No onboarded WDS AWS accounts found.${RESET}"
+            fi
+            echo ""
+
+            zs_get "/accountGroups" > "$WDS_TMPDIR/groups.json"
+            python3 -c "
+import json
+with open('$WDS_TMPDIR/groups.json') as f:
+    try:
+        data = json.load(f)
+    except Exception:
+        data = []
+with open('$WDS_TMPDIR/group_lines.txt', 'w') as out:
+    for g in data:
+        gid = g.get('id', '')
+        name = g.get('name', '?')
+        count = len(g.get('publicCloudAccounts', []))
+        out.write(f'{gid}|{name}|{count}\n')
+"
+            GROUP_LINES=()
+            while IFS= read -r line; do
+                GROUP_LINES+=("$line")
+            done < "$WDS_TMPDIR/group_lines.txt"
+
+            if [ ${#GROUP_LINES[@]} -gt 0 ]; then
+                echo "${GREEN}Account groups found:${RESET}"
+                i=1
+                for line in "${GROUP_LINES[@]}"; do
+                    IFS='|' read -r gid name count <<< "$line"
+                    echo "  $i) $name ($count account(s)) - Zscaler ID $gid"
+                    i=$((i+1))
+                done
+                read -r -p "${CYAN}Select groups to link as account_groups (comma-separated numbers, Enter to skip): ${RESET}" group_selection
+                if [ -n "$group_selection" ]; then
+                    account_groups=$(python3 -c "
+import json
+with open('$WDS_TMPDIR/group_lines.txt') as f:
+    lines = [l.strip() for l in f if l.strip()]
+sel = [int(x.strip()) for x in '$group_selection'.split(',') if x.strip()]
+ids = []
+for s in sel:
+    if 1 <= s <= len(lines):
+        ids.append(int(lines[s-1].split('|')[0]))
+print(json.dumps(ids))
+")
+                    echo "export TF_VAR_account_groups='$account_groups'" >> .zsecrc
+                    echo "${GREEN}Selected account_groups: $account_groups${RESET}"
+                fi
+            else
+                echo "${YELLOW}No account groups found.${RESET}"
+            fi
+            rm -rf "$WDS_TMPDIR"
+            echo ""
+        fi
+
+        # Fallback manual entry -- only asked if not already set via selection
+        # above (e.g. query failed, or nothing matched what the customer wants).
+        if [ -z "$allowed_accounts" ]; then
+            read -r -p "${CYAN}Enter allowed account IDs manually (comma-separated, e.g. 1591285,462801) [Enter to skip]: ${RESET}" allowed_acct_input
+            if [ -n "$allowed_acct_input" ]; then
+                allowed_accounts=$(python3 -c "import json; ids=[int(x.strip()) for x in '$allowed_acct_input'.split(',') if x.strip()]; print(json.dumps(ids))" 2>/dev/null)
+                echo "export TF_VAR_allowed_accounts='$allowed_accounts'" >> .zsecrc
+            fi
+        fi
+
+        if [ -z "$account_groups" ]; then
+            read -r -p "${CYAN}Enter account group IDs manually (comma-separated, e.g. 1595528,1173437) [Enter to skip]: ${RESET}" group_acct_input
+            if [ -n "$group_acct_input" ]; then
+                account_groups=$(python3 -c "import json; ids=[int(x.strip()) for x in '$group_acct_input'.split(',') if x.strip()]; print(json.dumps(ids))" 2>/dev/null)
+                echo "export TF_VAR_account_groups='$account_groups'" >> .zsecrc
+            fi
+        fi
+
+        echo ""
+        echo "${YELLOW}Optional: Whitelist AWS account IDs for VPC endpoint connections.${RESET}"
+        echo "${YELLOW}These are the 12-digit AWS account numbers allowed to create GWLB Endpoints to this ZTGW.${RESET}"
+
+        read -r -p "${CYAN}Enter AWS Account IDs (comma-separated, e.g. 123456789012,987654321098) [Enter to skip]: ${RESET}" aws_acct_input
+        if [ -n "$aws_acct_input" ]; then
+            additional_aws_accounts=$(python3 -c "import json; ids=[x.strip() for x in '$aws_acct_input'.split(',') if x.strip()]; print(json.dumps(ids))" 2>/dev/null)
+            echo "export TF_VAR_additional_aws_accounts='$additional_aws_accounts'" >> .zsecrc
+        fi
+        echo ""
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 4: Endpoint service name (endpoint-only mode)
+    # -----------------------------------------------------------------------
+    if [[ "$deploy_ztgw" == "false" ]]; then
+        echo "${YELLOW}--- Existing ZTGW Endpoint Service ---${RESET}"
+        echo ""
+        while [ -z "$endpoint_service_name" ]; do
+            read -r -p "${CYAN}Enter existing endpoint service name${RESET}
+${CYAN}(e.g. com.amazonaws.vpce.us-west-2.vpce-svc-xxxxxxxx): ${RESET}" endpoint_service_name
+        done
+        echo "export TF_VAR_endpoint_service_name='$endpoint_service_name'" >> .zsecrc
+        echo ""
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 5: Consumer-side configuration (full + endpoint-only modes)
+    # -----------------------------------------------------------------------
+    if [[ "$deploy_endpoint" == "true" ]]; then
+        echo "${YELLOW}--- Consumer VPC Endpoint Configuration ---${RESET}"
+        echo ""
+
+        if [[ "$deploy_ztgw" == "true" ]]; then
+            echo "${CYAN}AWS endpoint region: ${aws_region}${RESET}"
+        else
+            while [ -z "$aws_region" ]; do
+                read -r -p "${CYAN}Enter AWS region for the VPC Endpoint (e.g. us-west-2): ${RESET}" aws_region
+            done
+            echo "export TF_VAR_aws_endpoint_region='$aws_region'" >> .zsecrc
+        fi
+
+        while [ -z "$consumer_vpc_id" ]; do
+            read -r -p "${CYAN}Enter existing consumer VPC ID (e.g. vpc-xxxxx): ${RESET}" consumer_vpc_id
+        done
+        echo "export TF_VAR_consumer_vpc_id='$consumer_vpc_id'" >> .zsecrc
+
+        while [ -z "$consumer_subnets" ]; do
+            read -r -p "${CYAN}Enter subnet IDs (comma-separated, one per AZ): ${RESET}" consumer_subnets
+        done
+        consumer_subnet_ids=$(echo "$consumer_subnets" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" 2>/dev/null)
+        echo "export TF_VAR_consumer_subnet_ids='$consumer_subnet_ids'" >> .zsecrc
+
+        route_cidr_default="0.0.0.0/0"
+        read -r -p "${CYAN}Enter route destination CIDR [Default=$route_cidr_default]: ${RESET}" route_cidr_input
+        route_cidr=${route_cidr_input:-$route_cidr_default}
+        echo "export TF_VAR_consumer_route_cidr='$route_cidr'" >> .zsecrc
+
+        deploy_key_default="aws-ztgw"
+        read -r -p "${CYAN}Enter naming prefix for resources [Default=$deploy_key_default]: ${RESET}" deploy_key_input
+        deploy_key=${deploy_key_input:-$deploy_key_default}
+        echo "export TF_VAR_consumer_deploy_key='$deploy_key'" >> .zsecrc
+        echo ""
+    fi
+
+    if ! grep -Fxq "export PATH=\${PATH}:\${PWD}/bin" .zsecrc 2>/dev/null; then
+        echo 'export PATH=${PATH}:${PWD}/bin' >> .zsecrc
+    fi
+
+    # -----------------------------------------------------------------------
+    # Deployment summary
+    # -----------------------------------------------------------------------
+    echo "${GREEN}============================================================"
+    echo "               DEPLOYMENT SUMMARY"
+    echo "============================================================${RESET}"
+    echo ""
+    if [[ "$deploy_ztgw" == "true" && "$deploy_endpoint" == "true" ]]; then
+        echo "  Mode:                 ${GREEN}Full (ZTGW + VPC Endpoint)${RESET}"
+    elif [[ "$deploy_ztgw" == "true" ]]; then
+        echo "  Mode:                 ${GREEN}ZTGW-only${RESET}"
+    else
+        echo "  Mode:                 ${GREEN}Endpoint-only${RESET}"
+    fi
+
+    if [[ "$deploy_ztgw" == "true" ]]; then
+        echo "  Gateway Name:         ${GREEN}$gateway_name${RESET}"
+        echo "  AWS Region:           ${GREEN}$aws_region${RESET}"
+        echo "  Location Name:        ${GREEN}$location_name${RESET}"
+        if [ -n "$aws_acct_input" ]; then
+            echo "  AWS Account IDs:      ${GREEN}$aws_acct_input${RESET}"
+        fi
+    fi
+    if [[ "$deploy_ztgw" == "false" ]]; then
+        echo "  Endpoint Service:     ${GREEN}$endpoint_service_name${RESET}"
+    fi
+
+    echo "  Cloud:                ${GREEN}$cloud${RESET}"
+    echo "  Vanity Domain:        ${GREEN}$vanity_domain${RESET}"
+    if [ -n "$login_domain_input" ]; then
+        echo "  Login Domain:         ${GREEN}$login_domain_input${RESET} (override)"
+    fi
+
+    if [[ "$deploy_endpoint" == "true" ]]; then
+        echo "  VPC ID:               ${GREEN}$consumer_vpc_id${RESET}"
+        echo "  Subnets:              ${GREEN}$consumer_subnets${RESET}"
+        echo "  Route CIDR:           ${GREEN}$route_cidr${RESET}"
+        echo "  Deploy Key:           ${GREEN}$deploy_key${RESET}"
+    fi
+    echo ""
+
+    while true; do
+        read -r -p "${CYAN}Proceed with deployment? (yes/no): ${RESET}" proceed
+        case $proceed in
+            yes|y) break ;;
+            no|n)
+                echo "${YELLOW}Deployment cancelled. Configuration saved in .zsecrc${RESET}"
+                echo "${YELLOW}Re-run './zsec up' to deploy with saved configuration.${RESET}"
+                exit 0 ;;
+            *) echo "${RED}Invalid response. Enter yes or no${RESET}" ;;
+        esac
+    done
+fi
+
+if [[ -e ./.zsecrc ]]; then
+    echo "${GREEN}Loading configuration from .zsecrc...${RESET}"
+    . ./.zsecrc
+else
+    if [[ "$oper" == "destroy" ]]; then
+        latest_archive=$(ls -t .zsecrc-* 2>/dev/null | head -1)
+        if [ -n "$latest_archive" ]; then
+            echo "${YELLOW}.zsecrc not found, but archived config found: ${latest_archive}${RESET}"
+            read -r -p "${CYAN}Use this config for destroy? (yes/no): ${RESET}" use_archive
+            case $use_archive in
+                yes|y)
+                    cp "$latest_archive" .zsecrc
+                    echo "${GREEN}Restored .zsecrc from ${latest_archive}${RESET}"
+                    . ./.zsecrc ;;
+                *)
+                    echo "${RED}Cannot destroy without configuration. Exiting.${RESET}"
+                    exit 1 ;;
+            esac
+        else
+            echo "${RED}.zsecrc not found. Nothing to destroy.${RESET}"
+            exit 1
+        fi
+    fi
+fi
+
+if [ -z "$TF_VAR_client_id" ] || [ -z "$TF_VAR_client_secret" ] || [ -z "$TF_VAR_vanity_domain" ]; then
+    echo "${RED}Zscaler OneAPI credentials are missing. Delete .zsecrc and re-run './zsec up'${RESET}"
+    exit 1
+fi
+
+if [[ "$TF_VAR_deploy_endpoint" != "false" ]]; then
+    if [ -z "$TF_VAR_consumer_vpc_id" ] || [ -z "$TF_VAR_consumer_subnet_ids" ]; then
+        echo "${RED}Consumer VPC ID and subnet IDs are required. Delete .zsecrc and re-run './zsec up'${RESET}"
+        exit 1
+    fi
+fi
+
+if [[ "$TF_VAR_deploy_ztgw" == "false" && -z "$TF_VAR_endpoint_service_name" ]]; then
+    echo "${RED}Endpoint-only mode requires endpoint_service_name. Delete .zsecrc and re-run './zsec up'${RESET}"
+    exit 1
+fi
+
+if [[ "$oper" == "up" ]]; then
+
+    # Create ZTGW via Zscaler REST API before running Terraform
+    if [[ "$TF_VAR_deploy_ztgw" == "true" ]]; then
+        SKIP=false
+        if [[ -f .ztgw-output.json ]]; then
+            EXISTING_NAME=$(python3 -c "import json; print(json.load(open('.ztgw-output.json')).get('gateway_name',''))" 2>/dev/null || echo "")
+            if [[ "$EXISTING_NAME" == "$TF_VAR_gateway_name" ]]; then
+                echo "${GREEN}ZTGW '${TF_VAR_gateway_name}' already deployed, skipping.${RESET}"
+                SKIP=true
+            fi
+        fi
+
+        if [[ "$SKIP" == "false" ]]; then
+            echo ""
+            echo "${GREEN}--- Creating AWS ZTGW via Zscaler API ---${RESET}"
+            echo ""
+
+            python3 <<'PYEOF' | bash "$(dirname "$0")/scripts/deploy_ztgw.sh" > .ztgw-output.json
+import os, json
+print(json.dumps({
+    'client_id': os.environ.get('TF_VAR_client_id', ''),
+    'client_secret': os.environ.get('TF_VAR_client_secret', ''),
+    'vanity_domain': os.environ.get('TF_VAR_vanity_domain', ''),
+    'cloud': os.environ.get('TF_VAR_cloud', ''),
+    'login_domain': os.environ.get('TF_VAR_login_domain', ''),
+    'gateway_name': os.environ.get('TF_VAR_gateway_name', ''),
+    'aws_region': os.environ.get('TF_VAR_aws_region', ''),
+    'aws_region_code': os.environ.get('TF_VAR_aws_region_code', ''),
+    'availability_zone_ids': json.loads(os.environ.get('TF_VAR_availability_zone_ids') or '[]'),
+    'location_name': os.environ.get('TF_VAR_location_name', ''),
+    'allowed_accounts': json.loads(os.environ.get('TF_VAR_allowed_accounts') or '[]'),
+    'account_groups': json.loads(os.environ.get('TF_VAR_account_groups') or '[]'),
+    'additional_aws_accounts': json.loads(os.environ.get('TF_VAR_additional_aws_accounts') or '[]'),
+}))
+PYEOF
+            DEPLOY_EXIT=$?
+
+            if [ $DEPLOY_EXIT -ne 0 ] || [ ! -s .ztgw-output.json ]; then
+                echo "${RED}ZTGW creation failed. Check the output above.${RESET}"
+                rm -f .ztgw-output.json
+                exit 1
+            fi
+
+            echo ""
+            echo "${GREEN}ZTGW '${TF_VAR_gateway_name}' deployed and healthy.${RESET}"
+            echo ""
+        fi
+    fi
+
+    echo "${GREEN}Initializing Terraform...${RESET}"
+    ./bin/terraform init
+
+    echo ""
+    if [[ "$TF_VAR_deploy_endpoint" == "false" ]]; then
+        echo "${GREEN}Terraform will save ZTGW outputs to state.${RESET}"
+    elif [[ "$TF_VAR_deploy_ztgw" == "false" ]]; then
+        echo "${GREEN}Deploying VPC Endpoint (using existing endpoint service)...${RESET}"
+    else
+        echo "${GREEN}Deploying VPC Endpoint...${RESET}"
+    fi
+
+    ./bin/terraform apply -auto-approve
+
+    echo ""
+    echo "${GREEN}============================================================"
+    echo "  Deployment complete"
+    echo "============================================================${RESET}"
+    echo ""
+    echo "  Run ${CYAN}./bin/terraform output${RESET} to view all outputs."
+    echo "  Run ${CYAN}./zsec destroy${RESET} to tear down."
+    echo ""
+
+elif [[ "$oper" == "destroy" ]]; then
+    echo "${YELLOW}============================================================"
+    echo "               DESTROY SUMMARY"
+    echo "============================================================${RESET}"
+    echo ""
+    if [[ "$TF_VAR_deploy_ztgw" == "true" ]]; then
+        echo "  ${RED}- AWS ZTGW '${TF_VAR_gateway_name}' from Zscaler${RESET}"
+    fi
+    if [[ "$TF_VAR_deploy_endpoint" != "false" ]]; then
+        echo "  ${RED}- VPC Endpoint and routes from AWS${RESET}"
+    fi
+    echo ""
+
+    if [[ ! "$AUTO_APPROVE" ]]; then
+        while true; do
+            read -r -p "${CYAN}Are you sure you want to destroy? (yes/no): ${RESET}" confirm
+            case $confirm in
+                yes|y) break ;;
+                no|n) echo "${GREEN}Destroy cancelled.${RESET}"; exit 0 ;;
+                *) echo "${RED}Enter yes or no${RESET}" ;;
+            esac
+        done
+    fi
+
+    # Step 1: Delete ZTGW from Zscaler (if deployed)
+    if [[ "$TF_VAR_deploy_ztgw" == "true" ]]; then
+        echo "${YELLOW}--- Deleting AWS ZTGW from Zscaler ---${RESET}"
+        bash "$(dirname "$0")/scripts/destroy_ztgw.sh" || true
+        echo ""
+    fi
+
+    # Step 2: Destroy consumer-side AWS resources via Terraform
+    echo "${YELLOW}--- Destroying Terraform-managed resources ---${RESET}"
+    ./bin/terraform init
+    ./bin/terraform destroy -auto-approve
+
+    echo ""
+    echo "${YELLOW}Cleaning up local state and files...${RESET}"
+    rm -rf .terraform*
+    rm -f terraform.tfstate*
+    rm -f tfplan
+    rm -f .ztgw-output.json
+    rm -rf bin
+
+    now=$(date +'%Y-%m-%d-%H_%M_%S')
+    echo "Archiving .zsecrc to .zsecrc-${now}"
+    cp .zsecrc ".zsecrc-${now}"
+    rm -f .zsecrc .zsecrc.bak
+
+    echo ""
+    echo "${GREEN}============================================================"
+    echo "  Destroy complete. All resources and state cleaned up."
+    echo "============================================================${RESET}"
+    echo ""
+fi

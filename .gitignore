@@ -1,0 +1,13 @@
+.zsecrc
+.zsecrc-*
+.ztgw-output.json
+.ztgw-input.json
+bin/
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+*.tfvars
+!*.tfvars.example
+.DS_Store
+.devin/
